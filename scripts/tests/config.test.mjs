@@ -439,6 +439,45 @@ test('autofix token budget fits Groq free-tier 8K TPM for openai/gpt-oss-120b', 
     `system (${systemTokens}) + input (${maxInputTokens}) + output (${maxTokens}) must stay within 8000 TPM`);
 });
 
+test('loadLLMConfig returns maxInputTokens for the review stage', () => {
+  setEnv({ GROQ_API_KEY: 'groq-key' });
+  const { maxInputTokens } = loadLLMConfig('review');
+  assert.equal(typeof maxInputTokens, 'number');
+  assert.ok(maxInputTokens > 0, 'review maxInputTokens should be positive');
+});
+
+test('review token budget fits Groq free-tier 8K TPM for openai/gpt-oss-120b', () => {
+  setEnv({ GROQ_API_KEY: 'groq-key' });
+  const { maxInputTokens, maxTokens } = loadLLMConfig('review');
+  const systemTokens = estimateTokens(loadPrompt('pr-review-system'));
+  assert.ok(systemTokens + maxInputTokens + maxTokens <= 8000,
+    `system (${systemTokens}) + input (${maxInputTokens}) + output (${maxTokens}) must stay within 8000 TPM`);
+});
+
+test('loadLLMConfig returns undefined review maxInputTokens when the key is absent (no cap)', () => {
+  setEnv({ GROQ_API_KEY: 'groq-key' });
+  const original = GROQ_MODEL_DEFAULTS.review_max_input_tokens;
+  delete GROQ_MODEL_DEFAULTS.review_max_input_tokens;
+  try {
+    assert.equal(loadLLMConfig('review').maxInputTokens, undefined);
+  } finally {
+    GROQ_MODEL_DEFAULTS.review_max_input_tokens = original;
+  }
+});
+
+test('loadLLMConfig rejects invalid review max_input_tokens', () => {
+  setEnv({ GROQ_API_KEY: 'groq-key' });
+  const original = GROQ_MODEL_DEFAULTS.review_max_input_tokens;
+  for (const invalid of [-1, 0, 'not-a-number']) {
+    GROQ_MODEL_DEFAULTS.review_max_input_tokens = invalid;
+    try {
+      assert.throws(() => loadLLMConfig('review'), /Invalid max_input_tokens for stage "review"/);
+    } finally {
+      GROQ_MODEL_DEFAULTS.review_max_input_tokens = original;
+    }
+  }
+});
+
 test('loadConfigFromEnv forwards the generation reasoningEffort', () => {
   setEnv({ GROQ_API_KEY: 'groq-key', ISSUE_NUMBER: '1', ISSUE_TITLE: 't' });
   try {

@@ -261,6 +261,7 @@ The following modules also maintain **≥ 80% test coverage**, each enforced by 
 | `<stage>` | `openai/gpt-oss-120b` | Groq model. `GROQ_MODEL` overrides every stage. |
 | `<stage>_temperature` | per stage | `0`–`2`. |
 | `<stage>_max_tokens` | `1024` (validation, review), `4096` (generation, autofix) | Output cap, reasoning tokens included. Prompt + this value must stay under the Groq TPM per request (8K on the free tier), or Groq returns 413. |
+| `<stage>_max_input_tokens` | `3000` (autofix), `5000` (review) | Hard ceiling on the total user-prompt tokens for that stage. Only the `autofix` and `review` stages set it (Groq free-tier 8K TPM, ADR-0027). Remove the key to use the full model context window. |
 | `<stage>_reasoning_effort` | `low` | `low` \| `medium` \| `high`, sent as `reasoning_effort` only when set. `GROQ_REASONING_EFFORT` overrides every stage; `off` stops sending it (ADR-0025). |
 
 ## Auto-Fix Token Budget
@@ -290,6 +291,18 @@ The `token_estimate` log line emitted by `auto_fix_pr.mjs` shows the actual toke
 ```
 
 Monitor this to detect systematic truncation of diff or file contents.
+
+## Review Token Budget
+
+The `review` stage builds its LLM request from the diff (capped at 12,000 chars), the PR body, the dependency manifest context, change classification, automation-gate context and the tool-evidence block (ADR-0024). Only the diff was bounded, so a PR with a long body, a big manifest and failing checks (up to 2,000 chars of output tail per failing check) could exceed Groq's free-tier 8K TPM and get HTTP 413 — after which no verdict is posted.
+
+`review_max_input_tokens` caps the total user-prompt tokens so that `system + review_max_input_tokens + review_max_tokens` stays within the 8K TPM (default `5000` with the ~1,890-token `pr-review-system.md` and `review_max_tokens: 1024`). When the request exceeds the cap, `pr_review.mjs` trims sections in priority order:
+
+1. Dependency manifest context
+2. PR body
+3. Diff
+
+The tool-evidence block and the verdict format instructions are never trimmed (ADR-0024). When anything is trimmed, the prompt carries a `### ⚠️ Review input trimmed` notice (mirroring the `diffTruncated` warning) so the model knows it did not see the full PR. The `review.llm_request` observability event logs a per-section `token_estimate` breakdown (`system`, `wrapper`, `classification`, `automation_gate`, `manifests`, `body`, `diff`, `evidence`, `trim_notice`, `max_input_tokens`, `trimmed`). Remove the key to use the full model context window (e.g. after upgrading to Groq Dev Tier or switching to Anthropic).
 
 ## Checkpoint Resume
 

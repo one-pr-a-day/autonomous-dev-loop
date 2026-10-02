@@ -9,6 +9,8 @@ import os from 'node:os';
 import http from 'node:http';
 import { parseNestedYaml } from '../lib/yaml.mjs';
 import { buildAutomationGateContext } from '../lib/coverage_checker.mjs';
+import { estimateTokens } from '../lib/metrics.mjs';
+import { loadLLMConfig } from '../lib/config.mjs';
 
 const SCRIPTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ROOT_DIR = path.join(SCRIPTS_DIR, '..');
@@ -58,6 +60,8 @@ function makeHandler({
   prHeadRef = 'feature/test',
   prHeadSha = 'a'.repeat(40),
   autoFixRunsStatus = 200,
+  prDiff = SAMPLE_DIFF,
+  prBodyText = 'Test PR body',
 } = {}) {
   return (req, res) => {
     const { method, url } = req;
@@ -70,10 +74,10 @@ function makeHandler({
     if (method === 'GET' && /\/pulls\/\d+$/.test(url)) {
       if (req.headers['accept']?.includes('vnd.github.v3.diff')) {
         res.writeHead(diffStatus);
-        return res.end(diffStatus < 300 ? SAMPLE_DIFF : 'Forbidden');
+        return res.end(diffStatus < 300 ? prDiff : 'Forbidden');
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ title: 'Test PR', body: 'Test PR body', head: { ref: prHeadRef, sha: prHeadSha } }));
+      return res.end(JSON.stringify({ title: 'Test PR', body: prBodyText, head: { ref: prHeadRef, sha: prHeadSha } }));
     }
 
     if (method === 'GET' && url.includes('/issues/') && url.includes('/comments')) {
@@ -1000,4 +1004,82 @@ test('pr_review keeps the evidence section after the LLM review when nothing fai
     checks: [EVIDENCE_PASS],
   });
   assert.ok(body.indexOf('LLM findings here.') < body.indexOf('### 🧪 Tool Evidence'));
+});
+
+// --- Review input token budget (ADR-0027) ---
+
+const HUGE_PR_BODY = `# Huge PR\n\n${'This PR description is intentionally very long. '.repeat(3000)}`;
+const HUGE_DIFF = `--- a/big.js\n+++ b/big.js\n@@ -1 +1 @@\n+${'x'.repeat(4000)}\n`;
+const EVIDENCE_FAIL_TAIL = [
+  { name: 'tests', command: 'npm test', status: 'fail', exit_code: 1, duration_ms: 1, output_tail: `AssertionError: expected 2\n${'a'.repeat(1500)}` },
+  { name: 'lint', command: 'npm run lint', status: 'fail', exit_code: 1, duration_ms: 1, output_tail: `lint error line 5\n${'b'.repeat(1500)}` },
+];
+
+// The budget is a Groq free-tier TPM mechanism (ADR-0025/0027), so run on the Groq provider and
+// read the user message from the /v1/chat/completions request.
+function groqHandler(groqContent = 'Found issues.\n\nVerdict: REQUEST_CHANGES', overrides = {}) {
+  const base = makeHandler(overrides);
+  return (req, res) => {
+    if (req.url === '/v1/chat/completions') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ choices: [{ message: { content: groqContent } }] }));
+    }
+    return base(req, res);
+  };
+}
+
+async function runPrReviewGroq(port, eventFile, extraEnv = {}) {
+  return runPrReview(port, eventFile, {
+    ANTHROPIC_API_KEY: '',
+    GROQ_API_KEY: 'groq-test',
+    GROQ_API_URL: `http://127.0.0.1:${port}/v1/chat/completions`,
+    ...extraEnv,
+  });
+}
+
+test('pr_review keeps the LLM request within review_max_input_tokens with a huge body, large diff and failing checks', async () => {
+  process.env.GROQ_API_KEY = 'groq-key';
+  const { maxInputTokens } = loadLLMConfig('review');
+  const server = await startMockServer(groqHandler('Found issues.\n\nVerdict: REQUEST_CHANGES', { prDiff: HUGE_DIFF, prBodyText: HUGE_PR_BODY }));
+  const eventFile = await writeEventFile();
+  const evidenceFile = await writeEvidenceFile(EVIDENCE_FAIL_TAIL);
+  try {
+    const result = await runPrReviewGroq(server.address().port, eventFile, { REVIEW_EVIDENCE_PATH: evidenceFile });
+    assert.equal(result.code, 0, `expected exit 0, stderr: ${result.stderr}`);
+    const llmCall = server.requests.find((r) => r.url === '/v1/chat/completions');
+    assert.ok(llmCall, 'expected a Groq call');
+    const prompt = JSON.parse(llmCall.body).messages.find((m) => m.role === 'user').content;
+    assert.ok(estimateTokens(prompt) <= maxInputTokens,
+      `user prompt (${estimateTokens(prompt)} tokens) must fit within review_max_input_tokens (${maxInputTokens})`);
+    assert.match(prompt, /## Tool evidence/);
+    assert.match(prompt, /Output tail of failing check `tests`/);
+    assert.match(prompt, /Output tail of failing check `lint`/);
+    assert.match(prompt, /### ⚠️ Review input trimmed/);
+  } finally {
+    server.close();
+    await fs.unlink(eventFile).catch(() => {});
+    await fs.unlink(evidenceFile).catch(() => {});
+    delete process.env.GROQ_API_KEY;
+  }
+});
+
+test('pr_review does not trim when the request already fits within review_max_input_tokens', async () => {
+  process.env.GROQ_API_KEY = 'groq-key';
+  const server = await startMockServer(groqHandler('Found issues.\n\nVerdict: REQUEST_CHANGES', { prDiff: SAMPLE_DIFF, prBodyText: 'Test PR body' }));
+  const eventFile = await writeEventFile();
+  const evidenceFile = await writeEvidenceFile([EVIDENCE_FAIL_TAIL[0]]);
+  try {
+    const result = await runPrReviewGroq(server.address().port, eventFile, { REVIEW_EVIDENCE_PATH: evidenceFile });
+    assert.equal(result.code, 0, `expected exit 0, stderr: ${result.stderr}`);
+    const llmCall = server.requests.find((r) => r.url === '/v1/chat/completions');
+    const prompt = JSON.parse(llmCall.body).messages.find((m) => m.role === 'user').content;
+    assert.match(prompt, /Test PR body/);
+    assert.match(prompt, /## Tool evidence/);
+    assert.doesNotMatch(prompt, /Review input trimmed/);
+  } finally {
+    server.close();
+    await fs.unlink(eventFile).catch(() => {});
+    await fs.unlink(evidenceFile).catch(() => {});
+    delete process.env.GROQ_API_KEY;
+  }
 });

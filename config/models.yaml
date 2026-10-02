@@ -28,6 +28,11 @@ review_reasoning_effort: low
 # Review prompt ≈ 6.5K tokens (diff capped at 12,000 chars): 1024 output keeps it under 8K.
 # A truncated review has no verdict line and fails closed to REQUEST_CHANGES.
 review_max_tokens:      1024
+# Cap input tokens to stay within Groq free-tier TPM for openai/gpt-oss-120b (8k).
+# Total sent = system (~1,890, pr-review-system.md) + review_max_input_tokens + review_max_tokens ≈ 7,914.
+# pr_review.mjs trims dependency manifests, then the PR body, then the diff to stay within the cap;
+# tool evidence (ADR-0024) and the verdict format instructions are never trimmed (ADR-0027).
+review_max_input_tokens: 5000
 
 autofix:                openai/gpt-oss-120b
 autofix_temperature:    0.2

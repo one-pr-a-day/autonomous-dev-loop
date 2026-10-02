@@ -40,9 +40,20 @@ process.on('unhandledRejection', async (reason) => {
 const githubToken = requireEnv('GITHUB_TOKEN');
 const repository = requireEnv('GITHUB_REPOSITORY');
 const eventPath = requireEnv('GITHUB_EVENT_PATH');
-const { apiKey: llmApiKey, model, apiUrl, temperature, maxTokens: llmMaxTokens, reasoningEffort } = loadLLMConfig('review');
+const { apiKey: llmApiKey, model, apiUrl, temperature, maxTokens: llmMaxTokens, maxInputTokens: llmMaxInputTokens, reasoningEffort } = loadLLMConfig('review');
 const systemPrompt = loadPrompt('pr-review-system');
 const userPromptTemplate = loadPrompt('pr-review-user');
+
+// Notice appended to the review user prompt when review_max_input_tokens forces a trim (ADR-0027),
+// mirroring the diffTruncated warning: the model must know it did not see the full PR.
+const TRIM_NOTICE_TEMPLATE = [
+  '',
+  '',
+  '### ⚠️ Review input trimmed',
+  'To stay within review_max_input_tokens, these input sections were truncated: {{sections}}.',
+  'Tool evidence and the verdict format instructions are unchanged. Review only what is shown; do not imply you inspected the full PR.',
+  '',
+].join('\n');
 
 let event;
 try {
@@ -204,8 +215,8 @@ const diff = filterDiff(rawDiff);
 // no length cap, so comparing its length against the truncated `diff` above tells us whether
 // the 12,000-char cutoff actually cut anything — used to warn the reviewer it saw a partial diff.
 const diffTruncated = filterDiff(rawDiff, Infinity).length > diff.length;
+const classificationContext = buildChangeClassificationContext(rawDiff, diffTruncated);
 
-const baseUserPrompt = interpolatePrompt(userPromptTemplate, { diff, issueTitle: prTitle, issueBody: prBody });
 const dependencyManifestContext = await buildDependencyManifestContext(process.cwd());
 const evidencePath = process.env.REVIEW_EVIDENCE_PATH ?? path.join('evidence', 'review-evidence.json');
 const evidenceParse = fs.existsSync(evidencePath)
@@ -216,9 +227,80 @@ const evidence = assessEvidence(evidenceParse, {
   touchedPaths: findTouchedEvidencePaths(rawDiff),
 });
 log('Review evidence assessed', { prNumber, state: evidence.state, reason: evidence.reason, failing: evidence.failing, unverified: evidence.unverified });
-const userPrompt = `${baseUserPrompt}${buildChangeClassificationContext(rawDiff, diffTruncated)}${buildAutomationGateContext(rawDiff)}${dependencyManifestContext}${formatEvidenceContext(evidence)}`;
 
-obsLog({ stage: 'review', event: 'review.llm_request', level: 'info', meta: { model, input_tokens_est: estimateTokens(systemPrompt + userPrompt), prNumber } });
+// The review user prompt is bounded by review_max_input_tokens (ADR-0027). Tool evidence and the
+// verdict format instructions (the static template wrapper) are never trimmed; the remaining
+// sections are cut in priority order: dependency manifests → PR body → diff.
+const automationGateContext = buildAutomationGateContext(rawDiff);
+const evidenceContext = formatEvidenceContext(evidence);
+const userWrapperTokens = estimateTokens(userPromptTemplate.replace(/\{\{[^}]+\}\}/g, ''));
+
+let reviewDiff = diff;
+let reviewBody = prBody;
+let reviewManifests = dependencyManifestContext;
+const trimmedSections = [];
+if (llmMaxInputTokens != null) {
+  const fixedUserTokens =
+    userWrapperTokens +
+    estimateTokens(prTitle) +
+    estimateTokens(classificationContext) +
+    estimateTokens(automationGateContext) +
+    estimateTokens(evidenceContext);
+  const noticeTokens = estimateTokens(TRIM_NOTICE_TEMPLATE.replace('{{sections}}', 'diff, body, manifests'));
+  let remaining = Math.max(0, llmMaxInputTokens - fixedUserTokens - noticeTokens);
+  for (const name of ['diff', 'body', 'manifests']) {
+    const text = name === 'diff' ? diff : name === 'body' ? prBody : dependencyManifestContext;
+    const tokens = estimateTokens(text);
+    const alloc = Math.min(tokens, remaining);
+    const maxChars = alloc * 4;
+    if (text.length > maxChars) {
+      trimmedSections.push(name);
+      const cut = text.slice(0, maxChars);
+      if (name === 'diff') reviewDiff = cut;
+      else if (name === 'body') reviewBody = cut;
+      else reviewManifests = cut;
+    }
+    remaining -= alloc;
+  }
+}
+
+// Rebuild the classification context against the final diff so diff_truncated also reflects a
+// token-budget cut, then assemble the prompt with the trim notice last.
+const finalDiffTruncated = filterDiff(rawDiff, Infinity).length > reviewDiff.length;
+const finalClassificationContext = finalDiffTruncated === diffTruncated
+  ? classificationContext
+  : buildChangeClassificationContext(rawDiff, finalDiffTruncated);
+const trimNotice = trimmedSections.length > 0
+  ? TRIM_NOTICE_TEMPLATE.replace('{{sections}}', trimmedSections.join(', '))
+  : '';
+const userPrompt =
+  `${interpolatePrompt(userPromptTemplate, { diff: reviewDiff, issueTitle: prTitle, issueBody: reviewBody })}` +
+  `${finalClassificationContext}${automationGateContext}${reviewManifests}${evidenceContext}${trimNotice}`;
+
+const inputTokensEst = estimateTokens(systemPrompt + userPrompt);
+obsLog({
+  stage: 'review',
+  event: 'review.llm_request',
+  level: 'info',
+  meta: {
+    model,
+    input_tokens_est: inputTokensEst,
+    token_estimate: {
+      system: estimateTokens(systemPrompt),
+      wrapper: userWrapperTokens,
+      classification: estimateTokens(finalClassificationContext),
+      automation_gate: estimateTokens(automationGateContext),
+      manifests: estimateTokens(reviewManifests),
+      body: estimateTokens(reviewBody),
+      diff: estimateTokens(reviewDiff),
+      evidence: estimateTokens(evidenceContext),
+      trim_notice: estimateTokens(trimNotice),
+      max_input_tokens: llmMaxInputTokens ?? null,
+      trimmed: trimmedSections,
+    },
+    prNumber,
+  },
+});
 
 const rawReview = await callLLM({
   prompt: userPrompt,
@@ -363,7 +445,7 @@ const updatedPrMetrics = {
   ...prMetrics,
   review_cycles: prMetrics.review_cycles + 1,
   request_changes_count: prMetrics.request_changes_count + (isApproved ? 0 : 1),
-  total_input_tokens_est: prMetrics.total_input_tokens_est + estimateTokens(systemPrompt + userPrompt),
+  total_input_tokens_est: prMetrics.total_input_tokens_est + inputTokensEst,
   total_output_tokens_est: prMetrics.total_output_tokens_est + estimateTokens(cleanReview),
 };
 
